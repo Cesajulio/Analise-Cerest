@@ -9,72 +9,10 @@ import streamlit as st
 import plotly.express as px
 
 # ==========================================
-# 1. PySUS COMPATIBILITY MONKEYPATCH
+# 1. PARQUET OPTIMIZATION
 # ==========================================
-# PySUS 2.2.0 does not expose pysus.utilities.read_dbc.
-# We create a dummy module dynamically to fulfill the user's import requirement.
-class DummyModule(types.ModuleType):
-    pass
-
-def read_dbc(filename, encoding='iso-8859-1'):
-    """
-    Decompresses a DATASUS .dbc file using pyreaddbc and loads it into a Pandas DataFrame.
-    OPTIMIZATION:
-    Instead of decoding all ~343,000 rows in pure Python (which takes over 1 minute),
-    we decode only the 'ID_MUNICIP' column first, filter for the 14 regional municipalities,
-    and then decode the remaining columns for the ~714 matching rows.
-    This reduces cell decoding operations from 18.5 million to 38,000, speeding up load times by 10x.
-    """
-    from pyreaddbc import dbc2dbf
-    from dbfread import DBF
-    
-    # Create a temporary DBF file
-    fd, temp_dbf = tempfile.mkstemp(suffix='.dbf')
-    os.close(fd)
-    
-    try:
-        # Convert DBC to DBF
-        dbc2dbf(filename, temp_dbf)
-        
-        # Load the DBF file in raw byte mode
-        dbf = DBF(temp_dbf, encoding=encoding, raw=True)
-        df = pd.DataFrame(iter(dbf))
-        
-        # Decode only the geographical column first
-        if 'ID_MUNICIP' in df.columns:
-            df['ID_MUNICIP'] = df['ID_MUNICIP'].apply(
-                lambda x: x.decode(encoding, errors='replace').strip() 
-                if isinstance(x, bytes) else (x.strip() if isinstance(x, str) else x)
-            )
-            
-            # Filter for the 14 CEREST Cacoal/RO regional municipalities
-            municipios = [
-                '110004', '110009', '110120', '110018', '110147', '110148',
-                '110001', '110037', '110090', '110014', '110050', '110145',
-                '110028', '110029', '110059' # 110059 kept as fallback for Primavera
-            ]
-            df = df[df['ID_MUNICIP'].isin(municipios)].copy()
-            
-        # Decode all other columns for the small filtered subset
-        for col in df.columns:
-            if col != 'ID_MUNICIP':
-                df[col] = df[col].apply(
-                    lambda x: x.decode(encoding, errors='replace').strip() 
-                    if isinstance(x, bytes) else (x.strip() if isinstance(x, str) else x)
-                )
-        return df
-    finally:
-        # Secure cleanup of temporary DBF
-        if os.path.exists(temp_dbf):
-            try:
-                os.remove(temp_dbf)
-            except Exception:
-                pass
-
-# Register the injected module in sys.modules
-pysus_utilities_read_dbc = DummyModule('pysus.utilities.read_dbc')
-pysus_utilities_read_dbc.read_dbc = read_dbc
-sys.modules['pysus.utilities.read_dbc'] = pysus_utilities_read_dbc
+# O processamento pesado dos arquivos DBC (DATASUS) foi substituído
+# por uma base pré-processada em Parquet local.
 
 
 # ==========================================
@@ -206,9 +144,6 @@ CBO_FALLBACK = {
 # 3. STREAMLIT DATA LOADING & CACHING
 # ==========================================
 
-# Official user import requirement
-from pysus.utilities.read_dbc import read_dbc
-
 @st.cache_data
 def load_cbo_catalog():
     """
@@ -226,61 +161,13 @@ def load_cbo_catalog():
         return CBO_FALLBACK
 
 @st.cache_data
-def get_dashboard_data(filepaths):
+def get_dashboard_data():
     """
-    Reads, filters, cleans and typesets the Sinan DBC datasets.
+    Lê a base de dados otimizada em formato Parquet.
     """
-    all_dfs = []
-    for filepath in filepaths:
-        if not os.path.exists(filepath):
-            continue
-            
-        df = read_dbc(filepath, encoding='iso-8859-1')
-        
-        # Extract year from filename (e.g. ACGRBR25.dbc -> 2025)
-        basename = os.path.basename(filepath)
-        year_str = basename.replace('ACGRBR', '').replace('.dbc', '')
-        if year_str.isdigit():
-            ano = "20" + year_str
-        else:
-            ano = "Desconhecido"
-            
-        df['Ano_Notificacao'] = ano
-        all_dfs.append(df)
-        
-    if not all_dfs:
-        return pd.DataFrame()
-        
-    df = pd.concat(all_dfs, ignore_index=True)
-    
-    # Standardize columns to strip leading/trailing spaces and handle empty values
-    categorical_cols = ['EVOLUCAO', 'SIT_TRAB', 'ID_OCUPA_N', 'CNAE', 'ID_MUNICIP', 'CS_SEXO', 'CS_RACA', 'TIPO_ACID', 'NU_IDADE_N']
-    for col in categorical_cols:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-            df[col] = df[col].replace({'': 'Não Informado', 'None': 'Não Informado', 'nan': 'Não Informado'})
-        else:
-            df[col] = 'Não Informado'
-            
-    # Parse Idade (SINAN format)
-    def parse_sinan_age(age_str):
-        if not isinstance(age_str, str) or age_str in ('Não Informado', '', 'nan', 'None'):
-            return None
-        # SINAN format: 1st digit = unit (4 = years, 3 = months, 2 = days, 1 = hours)
-        # e.g., '4035' -> 35 years
-        if age_str.startswith('4') and len(age_str) == 4:
-            try:
-                return int(age_str[1:])
-            except:
-                return None
-        return None
-        
-    if 'NU_IDADE_N' in df.columns:
-        df['Idade_Anos'] = df['NU_IDADE_N'].apply(parse_sinan_age)
-    else:
-        df['Idade_Anos'] = None
-            
-    return df
+    if os.path.exists('dados_cerest.parquet'):
+        return pd.read_parquet('dados_cerest.parquet')
+    return pd.DataFrame()
 
 
 # ==========================================
@@ -293,15 +180,12 @@ st.set_page_config(
 )
 
 # Load database and CBO lookup table
-dbc_files = ['ACGRBR23.dbc', 'ACGRBR24.dbc', 'ACGRBR25.dbc', 'ACGRBR26.dbc']
-available_files = [f for f in dbc_files if os.path.exists(f)]
-
-if not available_files:
-    st.error(f"Erro: Nenhum dos arquivos base ({', '.join(dbc_files)}) foi encontrado no diretório atual.")
+if not os.path.exists('dados_cerest.parquet'):
+    st.error("Erro: O arquivo de dados otimizado (dados_cerest.parquet) não foi encontrado no diretório atual.")
     st.stop()
 
-with st.spinner("Decompressing and parsing DATASUS DBC files... Please wait."):
-    df_raw = get_dashboard_data(available_files)
+with st.spinner("Carregando base de dados..."):
+    df_raw = get_dashboard_data()
     cbo_catalog = load_cbo_catalog()
 
 # Apply human-readable lookups to columns
